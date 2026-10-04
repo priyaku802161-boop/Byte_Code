@@ -429,11 +429,11 @@
             
             <div id="modalMsg"></div>
             
-            <form id="crudModalForm" onsubmit="event.preventDefault(); handleModalSubmit();">
+            <form id="crudModalForm" onsubmit="event.preventDefault(); handleModalSubmit(event); return false;">
                 <div id="modalFields" style="display:flex; flex-direction:column; gap:12px;"></div>
                 <div class="modal-actions">
                     <button type="button" class="secondary" onclick="closeCrudModal()">Cancel</button>
-                    <button type="submit" class="primary" id="modalSubmitBtn">Save Changes</button>
+                    <button type="button" class="primary" id="modalSubmitBtn" onclick="handleModalSubmit(event)">Save Changes</button>
                 </div>
             </form>
         </div>

@@ -32,8 +32,14 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:3000",
         "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+        "null",
         "*"
     ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -154,12 +160,30 @@ def days_from_text(value: str) -> Set[str]:
     raw_tokens = [x.strip().lower() for x in str(value).replace(";", ",").split(",") if x.strip()]
     return {VALID_DAYS_MAP[x] for x in raw_tokens if x in VALID_DAYS_MAP}
 
+NO_EQUIPMENT_VALUES = {
+    "", "none", "n/a", "na", "not required", "not-required", "no equipment",
+    "no equipment required", "not applicable", "nil", "-", "any", "all", "null"
+}
+
+def is_no_equipment(val: Optional[str]) -> bool:
+    if not val:
+        return True
+    s = str(val).strip().lower()
+    if s in NO_EQUIPMENT_VALUES:
+        return True
+    clean = re.sub(r'[\s\.\-_/]+', '', s)
+    return clean in {"", "none", "na", "notrequired", "notapplicable", "nil", "any", "all", "null"}
+
 def is_equipment_compatible(required: Optional[str], available: Optional[str], lab_id: Optional[str] = "") -> bool:
-    if not required or not str(required).strip():
+    if is_no_equipment(required):
         return True
     req_tokens = [tok.strip().lower() for tok in re.split(r'[,;+&/]+', str(required)) if tok.strip()]
+    meaningful_tokens = [tok for tok in req_tokens if not is_no_equipment(tok)]
+    if not meaningful_tokens:
+        return True
     avail_str = f"{available or ''} {lab_id or ''}".lower()
-    return all(tok in avail_str for tok in req_tokens)
+    return all(tok in avail_str for tok in meaningful_tokens)
+
 
 def init_db():
     conn = get_db()
@@ -278,9 +302,10 @@ def init_db():
 
     conn.commit()
 
-    # Seed initial institutional admin user if empty
-    cursor.execute("SELECT COUNT(*) AS cnt FROM users WHERE LOWER(username) = 'admin@college.edu'")
-    if cursor.fetchone()["cnt"] == 0:
+    # Ensure institutional admin user exists and password verifies with password123
+    cursor.execute("SELECT username, password_hash, salt FROM users WHERE LOWER(username) = 'admin@college.edu'")
+    admin_row = cursor.fetchone()
+    if not admin_row or not verify_password("password123", admin_row["salt"], admin_row["password_hash"]):
         h, s = hash_password("password123")
         cursor.execute(
             "INSERT OR REPLACE INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)",
@@ -371,7 +396,7 @@ class Login(BaseModel):
 class Teacher(BaseModel):
     name: str
     subject: str
-    workload: int = Field(default=2, ge=1, le=50)
+    workload: int = Field(default=2, ge=0, le=100)
     availability: str = "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday"
 
 class Room(BaseModel):
@@ -391,7 +416,7 @@ class Section(BaseModel):
     year: str = "3rd Year"
     branch: str = "Computer Science"
     section: str = "A"
-    strength: int = Field(default=50, ge=1)
+    strength: int = Field(default=50, ge=0)
 
 class Subject(BaseModel):
     code: str
@@ -399,9 +424,9 @@ class Subject(BaseModel):
     teacher: str
     section: str
     type: str = "Classroom"
-    classes_per_week: int = Field(default=2, ge=1, le=30)
+    classes_per_week: int = Field(default=2, ge=0, le=50)
     required_equipment: Optional[str] = ""
-    duration: int = Field(default=1, ge=1, le=6)
+    duration: int = Field(default=1, ge=0, le=20)
     preferred_day: Optional[str] = ""
     preferred_period: Optional[str] = ""
     availability: Optional[str] = ""
@@ -475,11 +500,28 @@ def serve_js():
         return FileResponse(str(js_file), media_type="application/javascript")
     raise HTTPException(status_code=404, detail="script.js not found")
 
+@app.get("/api")
+@app.get("/api/")
 @app.get("/api/health")
+@app.get("/health")
 def health_check():
     return {"message": "Smart Timetable API is running", "status": "online", "database": "sqlite"}
 
+@app.get("/api/login")
+@app.get("/login")
+def login_get_info():
+    return {
+        "status": "online",
+        "message": "Login endpoint accepts POST requests with 'username' and 'password'",
+        "method": "POST",
+        "default_credentials": {
+            "username": "admin@college.edu",
+            "password": "password123"
+        }
+    }
+
 @app.post("/api/login")
+@app.post("/login")
 async def login(request: Request):
     content_type = request.headers.get("content-type", "")
     u = ""
@@ -528,6 +570,7 @@ async def login(request: Request):
     }
 
 @app.get("/api/auth/verify")
+@app.get("/auth/verify")
 def verify_session(current_user: Dict[str, Any] = Depends(get_current_user)):
     return {
         "status": "authenticated",
@@ -536,6 +579,7 @@ def verify_session(current_user: Dict[str, Any] = Depends(get_current_user)):
     }
 
 @app.post("/api/logout")
+@app.post("/logout")
 def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if credentials and credentials.credentials:
         ACTIVE_SESSIONS.pop(credentials.credentials.strip(), None)
@@ -611,7 +655,22 @@ def update_teacher(teacher_name: str, x: Teacher, current_user: Dict[str, Any] =
         if cursor.fetchone():
             conn.close()
             raise HTTPException(status_code=400, detail="Another teacher with this name already exists")
-        cursor.execute("UPDATE subjects SET teacher = ? WHERE LOWER(teacher) = ?", (new_clean, old_clean))
+    # Keep workload as a hard constraint: prevent reducing cap below currently assigned classes
+    cursor.execute(
+        "SELECT COALESCE(SUM(classes_per_week), 0) AS total_assigned FROM subjects WHERE LOWER(TRIM(teacher)) = LOWER(TRIM(?))",
+        (old_clean,)
+    )
+    assigned_total = int(cursor.fetchone()["total_assigned"])
+    if x.workload < assigned_total:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Teacher '{new_clean}' workload cap cannot be reduced to {x.workload} classes/week: "
+                f"Currently assigned total is {assigned_total} classes/week across subjects. "
+                f"Maximum capacity must be at least {assigned_total} classes/week."
+            )
+        )
 
     cursor.execute(
         "UPDATE teachers SET name = ?, subject = ?, workload = ?, availability = ? WHERE LOWER(name) = ?",
@@ -942,11 +1001,34 @@ def add_subject(x: Subject, current_user: Dict[str, Any] = Depends(get_current_u
         conn.close()
         raise HTTPException(status_code=400, detail="Subject with this code already exists")
     
-    # Validate referenced teacher and section exist in database
-    cursor.execute("SELECT name FROM teachers WHERE LOWER(name) = ?", (unquote(x.teacher).strip().lower(),))
-    if not cursor.fetchone():
+    # Validate referenced teacher and enforce workload capacity hard constraint
+    clean_teacher = unquote(x.teacher).strip()
+    cursor.execute("SELECT name, workload FROM teachers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (clean_teacher,))
+    teacher_row = cursor.fetchone()
+    if not teacher_row:
         conn.close()
         raise HTTPException(status_code=400, detail=f"Assigned teacher '{x.teacher}' does not exist in Teachers database")
+
+    canonical_teacher_name = teacher_row["name"]
+    teacher_workload_cap = int(teacher_row["workload"])
+
+    cursor.execute(
+        "SELECT COALESCE(SUM(classes_per_week), 0) AS total_assigned FROM subjects WHERE LOWER(TRIM(teacher)) = LOWER(TRIM(?))",
+        (canonical_teacher_name,)
+    )
+    current_assigned = int(cursor.fetchone()["total_assigned"])
+    new_total = current_assigned + x.classes_per_week
+
+    if new_total > teacher_workload_cap:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Teacher '{canonical_teacher_name}' workload cap exceeded: "
+                f"Assigned total would be {new_total} classes/week (currently assigned: {current_assigned}, requested: {x.classes_per_week}), "
+                f"which exceeds the maximum capacity of {teacher_workload_cap} classes/week."
+            )
+        )
     
     cursor.execute("SELECT name FROM sections WHERE LOWER(name) = ?", (unquote(x.section).strip().lower(),))
     if not cursor.fetchone():
@@ -992,10 +1074,35 @@ def update_subject(code: str, x: Subject, current_user: Dict[str, Any] = Depends
             conn.close()
             raise HTTPException(status_code=400, detail="Another subject with this code already exists")
 
-    cursor.execute("SELECT name FROM teachers WHERE LOWER(name) = ?", (unquote(x.teacher).strip().lower(),))
-    if not cursor.fetchone():
+    # Validate referenced teacher and enforce workload capacity hard constraint
+    clean_teacher = unquote(x.teacher).strip()
+    cursor.execute("SELECT name, workload FROM teachers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (clean_teacher,))
+    teacher_row = cursor.fetchone()
+    if not teacher_row:
         conn.close()
         raise HTTPException(status_code=400, detail=f"Assigned teacher '{x.teacher}' does not exist")
+
+    canonical_teacher_name = teacher_row["name"]
+    teacher_workload_cap = int(teacher_row["workload"])
+
+    # Calculate total classes_per_week across all other subjects assigned to this teacher (excluding this subject)
+    cursor.execute(
+        "SELECT COALESCE(SUM(classes_per_week), 0) AS total_assigned FROM subjects WHERE LOWER(TRIM(teacher)) = LOWER(TRIM(?)) AND LOWER(TRIM(code)) != LOWER(TRIM(?))",
+        (canonical_teacher_name, old_clean)
+    )
+    current_other_assigned = int(cursor.fetchone()["total_assigned"])
+    new_total = current_other_assigned + x.classes_per_week
+
+    if new_total > teacher_workload_cap:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Teacher '{canonical_teacher_name}' workload cap exceeded: "
+                f"Assigned total would be {new_total} classes/week (assigned in other subjects: {current_other_assigned}, requested: {x.classes_per_week}), "
+                f"which exceeds the maximum capacity of {teacher_workload_cap} classes/week."
+            )
+        )
 
     cursor.execute("SELECT name FROM sections WHERE LOWER(name) = ?", (unquote(x.section).strip().lower(),))
     if not cursor.fetchone():
@@ -1310,6 +1417,194 @@ def validate_generated_timetable(
     return is_all_valid, validation_report, failure_reasons
 
 
+def diagnose_solver_infeasibility(
+    classes: list,
+    teachers: list,
+    rooms: list,
+    labs: list,
+    sections: list,
+    subjects: list,
+    teaching_slots: list,
+    continuous_pairs: list,
+    next_consecutive_slot: dict,
+    teacher_by_name: dict,
+    section_by_name: dict
+) -> Tuple[str, str]:
+    """
+    Builds a targeted diagnostic CP-SAT model with slack variables on class occurrence constraints
+    to pinpoint the exact unschedulable subject, teacher, section, or resource causing infeasibility.
+    """
+    diag_model = cp_model.CpModel()
+    diag_x = {}
+
+    for c, (sub, teacher, section, matching_resources, _) in enumerate(classes):
+        t_avail = days_from_text(teacher.availability)
+        sub_avail_text = getattr(sub, "availability", "") or ""
+        sub_avail = days_from_text(sub_avail_text) if sub_avail_text.strip() else None
+
+        for d, day_name in enumerate(DAYS):
+            if day_name not in t_avail:
+                continue
+            if sub_avail and day_name not in sub_avail:
+                continue
+
+            for s_idx in range(len(teaching_slots)):
+                for ri, (kind, real_idx, res_obj) in enumerate(matching_resources):
+                    r_avail = days_from_text(res_obj.availability)
+                    if day_name not in r_avail:
+                        continue
+                    diag_x[(c, d, s_idx, ri)] = diag_model.NewBoolVar(f"diag_x_c{c}_d{d}_s{s_idx}_r{ri}")
+
+    # Slack variable for each class occurrence: slack[c] == 1 if occurrence c could not be scheduled
+    slacks = {}
+    for c in range(len(classes)):
+        c_vars = [v for (cc, _, _, _), v in diag_x.items() if cc == c]
+        sl = diag_model.NewBoolVar(f"diag_slack_{c}")
+        slacks[c] = sl
+        if c_vars:
+            diag_model.Add(sum(c_vars) + sl == 1)
+        else:
+            diag_model.Add(sl == 1)
+
+    # Hard constraints among scheduled classes
+    for d in range(len(DAYS)):
+        for s_idx in range(len(teaching_slots)):
+            for t in teachers:
+                diag_model.AddAtMostOne(
+                    v for (c, dd, ss, _), v in diag_x.items()
+                    if dd == d and ss == s_idx and classes[c][1].name == t.name
+                )
+            for sec in sections:
+                diag_model.AddAtMostOne(
+                    v for (c, dd, ss, _), v in diag_x.items()
+                    if dd == d and ss == s_idx and classes[c][2].name == sec.name
+                )
+            all_phys = [("room", i, r.id) for i, r in enumerate(rooms)] + [("lab", i, l.id) for i, l in enumerate(labs)]
+            for kind, real_i, _ in all_phys:
+                diag_model.AddAtMostOne(
+                    v for (c, dd, ss, ri), v in diag_x.items()
+                    if dd == d and ss == s_idx and
+                    classes[c][3][ri][0] == kind and classes[c][3][ri][1] == real_i
+                )
+
+    for t in teachers:
+        t_vars = [v for (c, d, s, ri), v in diag_x.items() if classes[c][1].name == t.name]
+        if t_vars:
+            diag_model.Add(sum(t_vars) <= t.workload)
+
+    for c_first, c_second in continuous_pairs:
+        for d in range(len(DAYS)):
+            for s_idx in range(len(teaching_slots)):
+                s_next = next_consecutive_slot.get(s_idx)
+                for ri in range(len(classes[c_first][3])):
+                    v_first = diag_x.get((c_first, d, s_idx, ri))
+                    if v_first is None:
+                        continue
+                    if s_next is None:
+                        diag_model.Add(v_first == 0)
+                    else:
+                        v2 = diag_x.get((c_second, d, s_next, ri))
+                        if v2 is None:
+                            diag_model.Add(v_first == 0)
+                        else:
+                            diag_model.Add(v_first == v2)
+
+    # HARD CONSTRAINT 8 in diagnostic model (with resource-aware scaling)
+    for sub in subjects:
+        dur = max(1, getattr(sub, "duration", 1) or 1)
+        eff_classes = max(sub.classes_per_week, dur if dur > 1 else 1)
+        num_blocks = math.ceil(eff_classes / dur)
+        sub_avail_text = getattr(sub, "availability", "") or ""
+        sub_avail = days_from_text(sub_avail_text) if sub_avail_text.strip() else set(DAYS)
+        t = teacher_by_name.get(sub.teacher.strip().lower())
+        t_avail = days_from_text(t.availability) if t else set(DAYS)
+        s = section_by_name.get(sub.section.strip().lower())
+        sub_m_res = []
+        for c_sub, _, _, m_res, _ in classes:
+            if c_sub.code == sub.code:
+                sub_m_res = m_res
+                break
+        res_avail = set()
+        for _, _, r_obj in sub_m_res:
+            res_avail |= days_from_text(r_obj.availability)
+        valid_days = sub_avail & t_avail & res_avail
+        if num_blocks <= len(valid_days):
+            max_blocks_per_day = 1
+        elif len(valid_days) > 0:
+            max_blocks_per_day = math.ceil(num_blocks / len(valid_days))
+        else:
+            max_blocks_per_day = len(teaching_slots)
+
+        for d in range(len(DAYS)):
+            sub_vars_day = [v for (c, dd, ss, _), v in diag_x.items() if dd == d and classes[c][0].code == sub.code]
+            if sub_vars_day:
+                diag_model.Add(sum(sub_vars_day) <= max_blocks_per_day * dur)
+
+    diag_model.Minimize(sum(slacks.values()))
+
+    diag_solver = cp_model.CpSolver()
+    diag_solver.parameters.max_time_in_seconds = 8.0
+    diag_solver.parameters.num_search_workers = 8
+    diag_status = diag_solver.Solve(diag_model)
+
+    unscheduled_by_subject = {}
+    if diag_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for c in range(len(classes)):
+            if diag_solver.Value(slacks[c]) == 1:
+                sub, teacher, section, matching_resources, occ = classes[c]
+                sub_code = sub.code
+                if sub_code not in unscheduled_by_subject:
+                    unscheduled_by_subject[sub_code] = {
+                        "subject": sub,
+                        "teacher": teacher,
+                        "section": section,
+                        "matching_resources": matching_resources,
+                        "failed_occurrences": []
+                    }
+                unscheduled_by_subject[sub_code]["failed_occurrences"].append(occ + 1)
+
+    if not unscheduled_by_subject:
+        return (
+            "No feasible timetable found: Over-constrained schedule.",
+            "The combination of faculty workload, availability days, room capacities, and weekly class requirements creates an over-constrained system. Try adding classrooms, relaxing teacher availability days, or reducing classes per week."
+        )
+
+    first_code = next(iter(unscheduled_by_subject.keys()))
+    first_info = unscheduled_by_subject[first_code]
+    first_sub = first_info["subject"]
+
+    msg = f"No feasible timetable found: Scheduling conflict for Subject '{first_sub.code}' ({first_sub.name})."
+
+    conflict_lines = []
+    conflict_lines.append(f"Diagnostic Analysis: Identified {len(unscheduled_by_subject)} unschedulable subject(s) due to hard constraint contention:")
+    for code, info in unscheduled_by_subject.items():
+        s = info["subject"]
+        sec = info["section"]
+        t = info["teacher"]
+        m_res = info["matching_resources"]
+        dur = max(1, getattr(s, "duration", 1) or 1)
+        stype = getattr(s, "type", "Classroom") or "Classroom"
+        failed_cnt = len(info["failed_occurrences"])
+
+        conflict_lines.append(f"\n• Subject [{code}] '{s.name}' (Section: '{sec.name}', Strength: {sec.strength}):")
+        conflict_lines.append(f"  - Unschedulable Occurrences: {failed_cnt} of {s.classes_per_week} classes/week (Period indices: {info['failed_occurrences']})")
+        conflict_lines.append(f"  - Assigned Teacher: '{t.name}' (Workload Cap: {t.workload} classes/week, Availability: '{t.availability}')")
+        conflict_lines.append(f"  - Course Type: {stype}, Block Duration: {dur} period(s), Equipment Requirement: '{getattr(s, 'required_equipment', '') or 'None'}'")
+        if m_res:
+            res_desc = ", ".join(f"{kind.upper()} {r.id} [cap: {r.capacity}, avail: '{r.availability}']" for kind, _, r in m_res[:4])
+            conflict_lines.append(f"  - Qualified Matching Resources ({len(m_res)}): {res_desc}")
+            conflict_lines.append(f"  - Root Cause: All suitable facility or teacher periods are fully occupied by competing subjects on the mutually available days.")
+        else:
+            conflict_lines.append(f"  - Qualified Matching Resources: 0 available. No {stype} meets section strength ({sec.strength}) and equipment requirements.")
+
+    conflict_lines.append("\nRecommended Actions to Resolve:")
+    conflict_lines.append("1. Verify teacher availability days and ensure they overlap with room/lab availability.")
+    conflict_lines.append("2. Add additional available days or periods to specialized facilities.")
+    conflict_lines.append("3. Reduce weekly class requirements or break long blocks into single periods.")
+
+    return msg, "\n".join(conflict_lines)
+
+
 # ==============================================================================
 # OR-Tools CP-SAT Timetable Constraint Solver (Dynamic & Multi-Constraint)
 # ==============================================================================
@@ -1375,6 +1670,42 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                 next_consecutive_slot[s_idx] = None
         else:
             next_consecutive_slot[s_idx] = None
+    # Calculate maximum unbroken teaching block between breaks
+    contiguous_blocks = []
+    cur_len = 0
+    for ats in all_timeslots:
+        if ats.type.lower() == "teaching":
+            cur_len += 1
+        else:
+            if cur_len > 0:
+                contiguous_blocks.append(cur_len)
+                cur_len = 0
+    if cur_len > 0:
+        contiguous_blocks.append(cur_len)
+    max_unbroken_block = max(contiguous_blocks, default=len(teaching_slots))
+
+    # Pre-solve check 1: Section strength validation
+    for sec in sections:
+        if sec.strength < 1:
+            return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Invalid student strength for section '{sec.name}'.",
+                          conflicts=f"Section '{sec.name}' has student strength {sec.strength}. Student strength must be at least 1.")
+
+    # Pre-solve check 2: Subject duration and classes_per_week validation
+    for sub in subjects:
+        if sub.classes_per_week < 1:
+            return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Invalid classes per week for subject '{sub.code}'.",
+                          conflicts=f"Subject '{sub.code}' ({sub.name}) has classes_per_week = {sub.classes_per_week}. Classes per week must be at least 1.")
+        dur = max(1, getattr(sub, "duration", 1) or 1)
+        if dur > max_unbroken_block:
+            return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Subject '{sub.code}' duration exceeds maximum continuous block.",
+                          conflicts=f"Subject '{sub.code}' ({sub.name}) requires a continuous duration of {dur} period(s), but the maximum unbroken teaching block between breaks in the schedule is only {max_unbroken_block} period(s).")
+
+    # Pre-solve check 3: Teacher availability configuration validation
+    for t in teachers:
+        t_avail = days_from_text(t.availability)
+        if not t_avail:
+            return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Invalid availability for teacher '{t.name}'.",
+                          conflicts=f"Teacher '{t.name}' has no valid teaching days configured (current value: '{t.availability}'). Allowed days are Monday to Saturday.")
 
     # If subjects table is empty, auto-generate initial syllabus from teachers and sections
     if not subjects:
@@ -1398,8 +1729,8 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
     # Verify referential integrity and calculate matching resources with equipment check
     def resources_for_subject(sub: Subject, sec: Section) -> List[Tuple[str, int, Any]]:
         stype = (sub.type or "").strip().lower()
+        req = getattr(sub, "required_equipment", "") or ""
         if stype == "lab":
-            req = getattr(sub, "required_equipment", "") or ""
             return [("lab", i, l) for i, l in enumerate(labs) if l.capacity >= sec.strength and is_equipment_compatible(req, l.equipment, l.id)]
         elif stype == "library":
             lib_rooms = [("room", i, r) for i, r in enumerate(rooms) if ("lib" in r.id.lower() or "lib" in (r.location or "").lower()) and r.capacity >= sec.strength]
@@ -1430,6 +1761,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
         is_lib = (stype == "library")
         target_kind = "Laboratory" if is_lab else ("Library" if is_lib else "Classroom")
         
+        # Pre-solve check 3: Room/Lab capacity and equipment compatibility
         if not matching_res:
             if is_lab:
                 if not labs:
@@ -1453,8 +1785,33 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                     return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Capacity mismatch for section '{s.name}'.",
                                   conflicts=f"Section '{s.name}' has student strength {s.strength}, but the maximum available {target_kind} capacity is {max_cap}.")
 
+        # Pre-solve check 4: Mutual availability overlap between teacher, subject, and facilities
+        sub_avail_text = getattr(sub, "availability", "") or ""
+        sub_avail = days_from_text(sub_avail_text) if sub_avail_text.strip() else set(DAYS)
+        t_avail = days_from_text(t.availability) if t else set(DAYS)
+        res_avail = set()
+        for _, _, r_obj in matching_res:
+            res_avail |= days_from_text(r_obj.availability)
+        valid_days = sub_avail & t_avail & res_avail
+        if not valid_days:
+            return Result(
+                status="error",
+                solver_status="INFEASIBLE",
+                message=f"No feasible timetable found: No overlapping days for subject '{sub.code}'.",
+                conflicts=f"Subject '{sub.code}' ({sub.name}) has no mutually available days among Teacher '{t.name}' (available: {', '.join(sorted(t_avail)) or 'None'}), Subject availability ({', '.join(sorted(sub_avail))}), and qualified facilities ({', '.join(f'{r.id} [{r.availability}]' for _, _, r in matching_res[:3])})."
+            )
+
         dur = max(1, getattr(sub, "duration", 1) or 1)
         effective_classes = max(sub.classes_per_week, dur if dur > 1 else 1)
+        max_sub_slots = len(valid_days) * len(teaching_slots)
+        if effective_classes > max_sub_slots:
+            return Result(
+                status="error",
+                solver_status="INFEASIBLE",
+                message=f"No feasible timetable found: Subject '{sub.code}' exceeds mutual available days capacity.",
+                conflicts=f"Subject '{sub.code}' ({sub.name}) requires {effective_classes} classes/week, but only {max_sub_slots} slots exist across the {len(valid_days)} mutually available days ({', '.join(sorted(valid_days))})."
+            )
+
         sub_c_indices = []
         for occ in range(effective_classes):
             c_idx = len(classes)
@@ -1471,7 +1828,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
     # Analytical constraint checks before invoking solver
     total_weekly_teaching_slots = len(DAYS) * len(teaching_slots)
 
-    # 1. Section overload check
+    # Pre-solve check 5: Section overload check
     section_workload = {}
     for sub, _, s, _, _ in classes:
         section_workload[s.name] = section_workload.get(s.name, 0) + 1
@@ -1480,15 +1837,17 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
             return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Section '{sec_name}' is overloaded.",
                           conflicts=f"Section '{sec_name}' requires {count} weekly classes, but only {total_weekly_teaching_slots} teaching slots exist per week ({len(DAYS)} days × {len(teaching_slots)} teaching periods).")
 
-    # 2. Teacher availability & hard workload cap check
+    # Pre-solve check 6: Teacher availability & hard workload cap check
     teacher_classes_map = {}
     for sub, t, _, _, _ in classes:
         teacher_classes_map[t.name] = teacher_classes_map.get(t.name, 0) + 1
     for t in teachers:
         t_count = teacher_classes_map.get(t.name, 0)
+        assigned_subs = [sub for sub in subjects if sub.teacher.strip().lower() == t.name.lower()]
+        assigned_desc = ", ".join(f"{s.code} ({s.classes_per_week} classes)" for s in assigned_subs)
         if t_count > t.workload:
             return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Teacher '{t.name}' workload cap exceeded.",
-                          conflicts=f"Teacher '{t.name}' is assigned {t_count} weekly classes across subjects, which exceeds their maximum workload cap of {t.workload} classes/week.")
+                          conflicts=f"Teacher '{t.name}' is assigned {t_count} weekly classes across {len(assigned_subs)} subject(s) [{assigned_desc}], which exceeds their maximum workload cap of {t.workload} classes/week.")
 
         t_avail = days_from_text(t.availability)
         if not t_avail:
@@ -1498,9 +1857,9 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
         max_t_slots = len(t_avail) * len(teaching_slots)
         if t_count > max_t_slots:
             return Result(status="error", solver_status="INFEASIBLE", message=f"No feasible timetable found: Teacher '{t.name}' is overloaded for available days.",
-                          conflicts=f"Teacher '{t.name}' is assigned {t_count} weekly classes, but can at most teach {max_t_slots} slots based on availability ({len(t_avail)} available days × {len(teaching_slots)} teaching periods).")
+                          conflicts=f"Teacher '{t.name}' is assigned {t_count} weekly classes [{assigned_desc}], but can at most teach {max_t_slots} slots based on availability ({len(t_avail)} available days [{', '.join(sorted(t_avail))}] × {len(teaching_slots)} teaching periods).")
 
-    # 3. Aggregate room and lab capacity checks
+    # Pre-solve check 7: Aggregate room and lab capacity checks
     total_lectures = sum(1 for sub, _, _, _, _ in classes if (sub.type or "").strip().lower() != "lab")
     total_labs_req = sum(1 for sub, _, _, _, _ in classes if (sub.type or "").strip().lower() == "lab")
     total_room_slots = len(rooms) * total_weekly_teaching_slots
@@ -1610,7 +1969,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                         else:
                             model.Add(v_first == v_second)
 
-    # HARD CONSTRAINT 8: Distribute blocks across available days so at most 1 block is scheduled per day
+    # HARD CONSTRAINT 8: Distribute blocks across available days
     for sub in subjects:
         dur = max(1, getattr(sub, "duration", 1) or 1)
         eff_classes = max(sub.classes_per_week, dur if dur > 1 else 1)
@@ -1619,12 +1978,24 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
         sub_avail = days_from_text(sub_avail_text) if sub_avail_text.strip() else set(DAYS)
         t = teacher_by_name.get(sub.teacher.strip().lower())
         t_avail = days_from_text(t.availability) if t else set(DAYS)
-        valid_days = sub_avail & t_avail
+        s = section_by_name.get(sub.section.strip().lower())
+        m_res = resources_for_subject(sub, s)
+        res_avail = set()
+        for _, _, r_obj in m_res:
+            res_avail |= days_from_text(r_obj.availability)
+        valid_days = sub_avail & t_avail & res_avail
+
         if num_blocks <= len(valid_days):
-            for d in range(len(DAYS)):
-                sub_vars_day = [v for (c, dd, ss, _), v in x.items() if dd == d and classes[c][0].code == sub.code]
-                if sub_vars_day:
-                    model.Add(sum(sub_vars_day) <= dur)
+            max_blocks_per_day = 1
+        elif len(valid_days) > 0:
+            max_blocks_per_day = math.ceil(num_blocks / len(valid_days))
+        else:
+            max_blocks_per_day = len(teaching_slots)
+
+        for d in range(len(DAYS)):
+            sub_vars_day = [v for (c, dd, ss, _), v in x.items() if dd == d and classes[c][0].code == sub.code]
+            if sub_vars_day:
+                model.Add(sum(sub_vars_day) <= max_blocks_per_day * dur)
 
     # ==============================================================================
     # SOFT CONSTRAINTS & MULTI-OBJECTIVE OPTIMIZATION (Compact Timetable & Min Gaps)
@@ -1648,12 +2019,20 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                     model.Add(y_var == 0)
                 y[(sec.name, d, s_idx)] = y_var
 
-    # 2. STRICT GAP PENALTY (Highest Priority: eliminate idle free periods between classes)
-    # If a section has an earlier class and a later class on the same day, any empty slot in between is penalized.
-    gap_penalty = max(weights.minimize_gaps, 2) * 60 + 80
+    # 2. ELIMINATE UNNECESSARY FREE PERIODS (Leading Free Periods & Internal Gaps)
+    # active_after[s] = 1 if there is any class at slot s or later that day.
+    # If active_after[s] == 1 and y[s] == 0, then slot s is an UNNECESSARY FREE PERIOD before or between classes.
+    # Post-dismissal periods (after the day's last class) have active_after[s] == 0 and are NOT penalized.
+    idle_penalty = max(weights.minimize_gaps, 1) * 100 + 150
+    gap_penalty = max(weights.minimize_gaps, 1) * 100 + 150
     for sec in sections:
         for d in range(len(DAYS)):
             y_day = [y[(sec.name, d, s)] for s in range(num_teaching)]
+            for s in range(num_teaching):
+                act_after = model.NewBoolVar(f"act_after_{sec.name}_d{d}_s{s}")
+                model.AddMaxEquality(act_after, y_day[s:])
+                objective_terms.append(-idle_penalty * (act_after - y_day[s]))
+
             for s in range(1, num_teaching - 1):
                 has_earlier = model.NewBoolVar(f"early_{sec.name}_d{d}_s{s}")
                 has_later = model.NewBoolVar(f"later_{sec.name}_d{d}_s{s}")
@@ -1663,8 +2042,16 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                 model.Add(gap >= has_earlier + has_later - 1 - y_day[s])
                 objective_terms.append(-gap_penalty * gap)
 
-    # 3. CONSECUTIVE PERIODS BONUS (Clusters classes together into solid contiguous blocks)
-    consec_bonus = max(weights.minimize_gaps, 2) * 20 + 20
+    # 3. FILL AVAILABLE PERIODS COMPACTLY FROM EARLIEST SLOTS (Morning Gradient)
+    # Earlier teaching slots get higher reward, strictly packing required classes into slots 0, 1, 2...
+    slot_scale = max(weights.morning_preference, 1) * 15 + 25
+    for sec in sections:
+        for d in range(len(DAYS)):
+            for s in range(num_teaching):
+                objective_terms.append((num_teaching - s) * slot_scale * y[(sec.name, d, s)])
+
+    # 4. CONSECUTIVE PERIODS BONUS (Clusters classes into contiguous blocks)
+    consec_bonus = max(weights.minimize_gaps, 1) * 25 + 30
     for sec in sections:
         for d in range(len(DAYS)):
             for s in range(num_teaching - 1):
@@ -1673,29 +2060,27 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                 model.Add(consec <= y[(sec.name, d, s + 1)])
                 objective_terms.append(consec_bonus * consec)
 
-    # 4. COMPACT DAY-START GRADIENT (Packs schedule towards early periods so classes finish compactly)
-    morning_scale = max(weights.morning_preference, 1)
-    for sec in sections:
-        for d in range(len(DAYS)):
-            for s in range(num_teaching):
-                # Earlier slots receive higher positive weight
-                objective_terms.append((num_teaching - 1 - s) * morning_scale * 10 * y[(sec.name, d, s)])
-
-    # 5. BALANCED DISTRIBUTION ACROSS MONDAY-FRIDAY
+    # 5. BALANCED DAILY LOAD (Prevent sparse 1-class days with many free periods)
     for sec in sections:
         sec_classes_cnt = sum(1 for c, (sub, _, s, _, _) in enumerate(classes) if s.name == sec.name)
-        max_day_cap = max(1, math.ceil(sec_classes_cnt / len(DAYS)) + 1)
+        min_healthy = min(3, max(1, sec_classes_cnt // len(DAYS)))
+        max_healthy = min(num_teaching, math.ceil(sec_classes_cnt / len(DAYS)) + 1)
         for d in range(len(DAYS)):
-            day_active = model.NewBoolVar(f"day_act_{sec.name}_d{d}")
             y_day = [y[(sec.name, d, s)] for s in range(num_teaching)]
-            model.AddMaxEquality(day_active, y_day)
-            objective_terms.append(35 * day_active)
-
-            # Soft excess penalty if a single day receives too many classes when others are empty
             day_sum = sum(y_day)
+            day_active = model.NewBoolVar(f"day_act_{sec.name}_d{d}")
+            model.AddMaxEquality(day_active, y_day)
+
+            # Penalize sparse days where section attends for fewer than min_healthy classes
+            sparse = model.NewIntVar(0, num_teaching, f"sparse_{sec.name}_d{d}")
+            model.Add(sparse >= min_healthy * day_active - day_sum)
+            objective_terms.append(-100 * sparse)
+
+            # Soft excess penalty if a single day exceeds max_healthy
             excess = model.NewIntVar(0, num_teaching, f"excess_{sec.name}_d{d}")
-            model.Add(excess >= day_sum - max_day_cap)
-            objective_terms.append(-25 * excess)
+            model.Add(excess >= day_sum - max_healthy)
+            objective_terms.append(-40 * excess)
+
 
     # 6. FACULTY WORKLOAD SPREAD
     if weights.balance_workload > 0:
@@ -1719,7 +2104,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                     model.Add(dup >= sum(sub_vars_day) - 1)
                     objective_terms.append(-50 * dup)
 
-    # 8. OPTIONAL PREFERRED PERIOD REWARD
+    # 8. OPTIONAL PREFERRED PERIOD REWARD (Soft bonus)
     for c, (sub, teacher, section, matching_resources, _) in enumerate(classes):
         sub_pref_period = (getattr(sub, "preferred_period", "") or "").strip().lower()
         if sub_pref_period and sub_pref_period not in ("any", "none", "flexible"):
@@ -1729,9 +2114,9 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                         for ri in range(len(matching_resources)):
                             v = x.get((c, d, s_idx, ri))
                             if v is not None:
-                                objective_terms.append(800 * v)
+                                objective_terms.append(40 * v)
 
-    # 9. OPTIONAL PREFERRED DAY REWARD FOR MULTI-SESSION SUBJECTS
+    # 9. OPTIONAL PREFERRED DAY REWARD FOR MULTI-SESSION SUBJECTS (Soft bonus)
     for c, (sub, teacher, section, matching_resources, _) in enumerate(classes):
         sub_pref_day = (getattr(sub, "preferred_day", "") or "").strip().lower()
         if sub_pref_day and sub_pref_day not in ("any", "all", "none"):
@@ -1741,7 +2126,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
                         for ri in range(len(matching_resources)):
                             v = x.get((c, d, s_idx, ri))
                             if v is not None:
-                                objective_terms.append(500 * v)
+                                objective_terms.append(30 * v)
 
     if objective_terms:
         model.Maximize(sum(objective_terms))
@@ -1749,14 +2134,28 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
     # Solve CP-SAT model
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 15.0
+    solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        msg, conflicts = diagnose_solver_infeasibility(
+            classes=classes,
+            teachers=teachers,
+            rooms=rooms,
+            labs=labs,
+            sections=sections,
+            subjects=subjects,
+            teaching_slots=teaching_slots,
+            continuous_pairs=continuous_pairs,
+            next_consecutive_slot=next_consecutive_slot,
+            teacher_by_name=teacher_by_name,
+            section_by_name=section_by_name,
+        )
         return Result(
             status="error",
             solver_status="INFEASIBLE",
-            message="No feasible timetable found: Over-constrained schedule.",
-            conflicts="The combination of faculty workload, availability days, room capacities, and weekly class requirements creates an over-constrained system. Try adding classrooms, relaxing teacher availability days, or reducing classes per week."
+            message=msg,
+            conflicts=conflicts
         )
 
     # Build schedule mapping: schedule_map[d][s_idx] = list of Session
@@ -1936,3 +2335,7 @@ def generate_timetable(weights: Weights, current_user: Dict[str, Any] = Depends(
         print("Warning: failed to persist timetable state:", e)
 
     return res
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

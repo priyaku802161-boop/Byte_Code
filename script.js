@@ -6,14 +6,13 @@ function getApiBaseUrl() {
     if (window.API_BASE_URL) {
         return window.API_BASE_URL.replace(/\/+$/, "");
     }
-    const host = window.location.hostname;
-    const isLocalDevHost = host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || !host;
+    const host = (window.location.hostname || "").toLowerCase();
+    const isLocalDevHost = !host || host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
 
-    // When served from local dev tools (e.g. VS Code Live Server on port 5500, 3000, 5173) or file://,
-    // point API requests directly to FastAPI backend on port 8000
-    if (window.location.protocol === "file:" || (isLocalDevHost && window.location.port !== "8000")) {
-        const targetHost = (host === "localhost") ? "localhost" : "127.0.0.1";
-        return `http://${targetHost}:8000/api`;
+    // When running locally (via VS Code Live Server 5500, Vite 5173, file://, localhost:8000, 127.0.0.1:8000, etc.),
+    // connect directly to http://127.0.0.1:8000/api
+    if (window.location.protocol === "file:" || isLocalDevHost) {
+        return "http://127.0.0.1:8000/api";
     }
 
     if (window.location.protocol.startsWith("http")) {
@@ -223,6 +222,8 @@ async function api(path, opts = {}) {
 // Navigation & Views
 // ==============================================================================
 function page(id) {
+    sessionStorage.setItem("currentPage", id);
+
     document.querySelectorAll(".page").forEach(el => el.classList.add("hidden"));
     const target = document.getElementById(id);
     if (target) {
@@ -239,7 +240,8 @@ function page(id) {
     }
 
     if (id === "data") {
-        loadTab(currentTab);
+        const targetTab = currentTab || sessionStorage.getItem("currentTab") || "teachers";
+        loadTab(targetTab);
     } else if (id === "dashboard") {
         refreshStats();
     } else if (id === "timetable") {
@@ -303,7 +305,9 @@ async function checkSession() {
                 timetableInvalidationMessage = "Data changed — please regenerate the timetable.";
             }
 
-            refreshStats();
+            // Restore saved view (defaults to dashboard if no previous page)
+            const savedPage = sessionStorage.getItem("currentPage") || "dashboard";
+            page(savedPage);
             return;
         } catch (err) {
             console.warn("Session verification failed:", err);
@@ -497,6 +501,13 @@ function renderFieldInput(prefix, f, defaultVal = "") {
 
 async function loadTab(tab) {
     currentTab = tab;
+    sessionStorage.setItem("currentTab", tab);
+
+    // Synchronize tab buttons active class
+    document.querySelectorAll("[data-tab]").forEach(b => {
+        b.classList.toggle("active", b.dataset.tab === tab);
+    });
+
     const c = configs[tab];
     const dataPanel = document.getElementById("dataPanel");
     if (!dataPanel) return;
@@ -564,10 +575,10 @@ async function loadTab(tab) {
             
             <div id="dataTabMsg"></div>
             
-            <form id="addResourceForm" onsubmit="event.preventDefault(); addItem('${tab}');">
+            <form id="addResourceForm" onsubmit="event.preventDefault(); addItem('${tab}'); return false;">
                 <div class="form-grid">
                     ${formInputs}
-                    <button type="submit" class="primary"><i class="fa-solid fa-plus"></i> ➕ Add ${c.singular}</button>
+                    <button type="button" class="primary" onclick="addItem('${tab}')"><i class="fa-solid fa-plus"></i> ➕ Add ${c.singular}</button>
                 </div>
             </form>
             
@@ -579,6 +590,133 @@ async function loadTab(tab) {
             </div>
         </div>
     `;
+    if (tab === "subjects") {
+        setupSubjectWorkloadLiveIndicator("f");
+    }
+}
+
+// ==============================================================================
+// Teacher Workload Hard-Constraint Validation & Helpers
+// ==============================================================================
+async function validateTeacherWorkload(teacherName, addedPeriods, excludeSubjectCode = null) {
+    const cleanTeacher = (teacherName || "").trim();
+    if (!cleanTeacher) {
+        return { valid: true };
+    }
+
+    // Ensure teachers cache is populated
+    let teachers = tabDataCache["teachers"];
+    if (!Array.isArray(teachers) || teachers.length === 0) {
+        try {
+            teachers = await api("/teachers");
+            tabDataCache["teachers"] = teachers;
+        } catch (e) {
+            teachers = [];
+        }
+    }
+
+    // Ensure subjects cache is populated
+    let subjects = tabDataCache["subjects"];
+    if (!Array.isArray(subjects) || subjects.length === 0) {
+        try {
+            subjects = await api("/subjects");
+            tabDataCache["subjects"] = subjects;
+        } catch (e) {
+            subjects = [];
+        }
+    }
+
+    const matchedTeacher = teachers.find(t => (t.name || "").trim().toLowerCase() === cleanTeacher.toLowerCase());
+    if (!matchedTeacher) {
+        return {
+            valid: false,
+            notFound: true,
+            message: `Assigned teacher "${cleanTeacher}" does not exist in Teachers database.`
+        };
+    }
+
+    const cap = Number(matchedTeacher.workload) || 0;
+    const excludeClean = excludeSubjectCode ? String(excludeSubjectCode).trim().toLowerCase() : null;
+
+    const assignedOther = subjects
+        .filter(s => (s.teacher || "").trim().toLowerCase() === cleanTeacher.toLowerCase() &&
+                     (!excludeClean || (s.code || "").trim().toLowerCase() !== excludeClean))
+        .reduce((sum, s) => sum + (Number(s.classes_per_week) || 0), 0);
+
+    const periodsNum = Number(addedPeriods) || 0;
+    const newTotal = assignedOther + periodsNum;
+
+    if (newTotal > cap) {
+        const contextStr = excludeClean ? `assigned in other subjects: ${assignedOther}` : `currently assigned: ${assignedOther}`;
+        return {
+            valid: false,
+            teacherName: matchedTeacher.name,
+            workloadCap: cap,
+            assignedTotal: newTotal,
+            currentAssigned: assignedOther,
+            requested: periodsNum,
+            message: `Teacher "${matchedTeacher.name}" workload cap exceeded: Assigned total would be ${newTotal} classes/week (${contextStr}, requested: ${periodsNum}), which exceeds maximum capacity of ${cap} classes/week.`
+        };
+    }
+
+    return {
+        valid: true,
+        teacherName: matchedTeacher.name,
+        workloadCap: cap,
+        assignedTotal: newTotal,
+        currentAssigned: assignedOther,
+        requested: periodsNum,
+        remaining: cap - newTotal
+    };
+}
+
+function setupSubjectWorkloadLiveIndicator(prefix, excludeCode = null) {
+    const teacherInput = document.getElementById(`${prefix}_teacher`);
+    const classesInput = document.getElementById(`${prefix}_classes_per_week`);
+    if (!teacherInput || !classesInput) return;
+
+    let hintEl = document.getElementById(`${prefix}_workload_hint`);
+    if (!hintEl) {
+        hintEl = document.createElement("div");
+        hintEl.id = `${prefix}_workload_hint`;
+        hintEl.style.cssText = "font-size:0.8rem;margin-top:6px;border-radius:6px;padding:6px 10px;display:none;transition:all 0.2s ease;";
+        const parent = classesInput.closest("div") || classesInput.parentElement;
+        if (parent) {
+            parent.appendChild(hintEl);
+        }
+    }
+
+    const updateHint = async () => {
+        const teacherName = teacherInput.value.trim();
+        const periods = Number(classesInput.value) || 0;
+        if (!teacherName || periods <= 0) {
+            hintEl.style.display = "none";
+            return;
+        }
+
+        const res = await validateTeacherWorkload(teacherName, periods, excludeCode);
+        if (res.notFound) {
+            hintEl.style.display = "block";
+            hintEl.className = "status warn";
+            hintEl.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Teacher "${escapeHtml(teacherName)}" not found in Teachers database.`;
+        } else if (!res.valid) {
+            hintEl.style.display = "block";
+            hintEl.className = "status error";
+            hintEl.innerHTML = `<i class="fa-solid fa-circle-xmark"></i> <strong>Workload Cap Exceeded:</strong> Total would be ${res.assignedTotal} / ${res.workloadCap} classes/week (+${res.requested} exceeds capacity by ${res.assignedTotal - res.workloadCap})`;
+        } else {
+            hintEl.style.display = "block";
+            hintEl.className = "status success";
+            hintEl.innerHTML = `<i class="fa-solid fa-circle-check"></i> <strong>Workload Capacity OK:</strong> Total will be ${res.assignedTotal} / ${res.workloadCap} classes/week (${res.remaining} remaining)`;
+        }
+    };
+
+    teacherInput.addEventListener("input", updateHint);
+    teacherInput.addEventListener("change", updateHint);
+    classesInput.addEventListener("input", updateHint);
+    classesInput.addEventListener("change", updateHint);
+    if (excludeCode) {
+        setTimeout(updateHint, 80);
+    }
 }
 
 async function addItem(tab) {
@@ -588,14 +726,20 @@ async function addItem(tab) {
 
     for (const f of c.fields) {
         const input = document.getElementById("f_" + f[0]);
-        if (!input || !input.value.trim()) {
+        const val = input ? input.value.trim() : "";
+        if (!val) {
+            const isOptional = (f[0] === "required_equipment" || f[0] === "preferred_period" || f[0] === "preferred_day" || f[0] === "availability");
+            if (isOptional) {
+                body[f[0]] = (f[0] === "preferred_day") ? "Any" : "";
+                continue;
+            }
             if (msgEl) {
                 msgEl.className = "status error";
                 msgEl.textContent = `Please fill out "${f[1]}".`;
             }
             return;
         }
-        body[f[0]] = f[2] === "number" ? Number(input.value.trim()) : input.value.trim();
+        body[f[0]] = f[2] === "number" ? Number(val) : val;
     }
 
     if (tab === "subjects") {
@@ -610,6 +754,18 @@ async function addItem(tab) {
             }
             return;
         }
+
+        // Hard-constraint teacher workload capacity check before saving
+        const workloadCheck = await validateTeacherWorkload(body.teacher, periods);
+        if (!workloadCheck.valid) {
+            if (msgEl) {
+                msgEl.className = "status error";
+                msgEl.textContent = workloadCheck.message;
+            } else {
+                alert(workloadCheck.message);
+            }
+            return;
+        }
     }
 
     try {
@@ -618,9 +774,13 @@ async function addItem(tab) {
             body: JSON.stringify(body)
         });
         
+        tabDataCache["subjects"] = null;
+        tabDataCache["teachers"] = null;
+        currentTab = tab;
         await loadTab(tab);
-        await fetchTimeSlots();
-        await refreshStats();
+        if (tab === "timeslots") {
+            await fetchTimeSlots();
+        }
         invalidateClientTimetable("Data changed — please regenerate the timetable.");
         showTabMessage(`✓ Successfully added ${c.singular} "${body[c.idKey]}".`, "success");
     } catch (err) {
@@ -653,6 +813,10 @@ function openAddModal(tab) {
 
     if (modalFields) {
         modalFields.innerHTML = c.fields.map(f => renderFieldInput("m", f)).join("");
+    }
+
+    if (tab === "subjects") {
+        setupSubjectWorkloadLiveIndicator("m", null);
     }
 
     modal.classList.add("active");
@@ -696,6 +860,10 @@ function openEditModal(tab, encodedId) {
         }).join("");
     }
 
+    if (tab === "subjects") {
+        setupSubjectWorkloadLiveIndicator("m", rawId);
+    }
+
     modal.classList.add("active");
     setTimeout(() => {
         const firstInput = modalFields ? modalFields.querySelector("input, select") : null;
@@ -718,7 +886,11 @@ function handleModalOverlayClick(event) {
     }
 }
 
-async function handleModalSubmit() {
+async function handleModalSubmit(event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
     const { mode, tab, originalId } = modalState;
     const c = configs[tab];
     const msgEl = document.getElementById("modalMsg");
@@ -789,6 +961,48 @@ async function handleModalSubmit() {
             if (submitBtn) submitBtn.disabled = false;
             return;
         }
+
+        // Hard-constraint teacher workload capacity check before saving modal
+        const excludeCode = (mode === "edit") ? originalId : null;
+        const workloadCheck = await validateTeacherWorkload(body.teacher, periods, excludeCode);
+        if (!workloadCheck.valid) {
+            if (msgEl) {
+                msgEl.className = "status error";
+                msgEl.textContent = workloadCheck.message;
+            } else {
+                alert(workloadCheck.message);
+            }
+            if (submitBtn) submitBtn.disabled = false;
+            return;
+        }
+    }
+
+    if (tab === "teachers" && mode === "edit") {
+        const teacherName = originalId ? String(originalId).trim() : (body.name || "").trim();
+        const newCap = Number(body.workload) || 0;
+        let subjects = tabDataCache["subjects"];
+        if (!Array.isArray(subjects) || subjects.length === 0) {
+            try {
+                subjects = await api("/subjects");
+                tabDataCache["subjects"] = subjects;
+            } catch (e) {
+                subjects = [];
+            }
+        }
+        const currentAssigned = subjects
+            .filter(s => (s.teacher || "").trim().toLowerCase() === teacherName.toLowerCase())
+            .reduce((sum, s) => sum + (Number(s.classes_per_week) || 0), 0);
+        if (newCap < currentAssigned) {
+            const errMsg = `Teacher "${body.name || teacherName}" workload cap cannot be reduced to ${newCap} classes/week: Currently assigned total is ${currentAssigned} classes/week across subjects. Maximum capacity must be at least ${currentAssigned} classes/week.`;
+            if (msgEl) {
+                msgEl.className = "status error";
+                msgEl.textContent = errMsg;
+            } else {
+                alert(errMsg);
+            }
+            if (submitBtn) submitBtn.disabled = false;
+            return;
+        }
     }
 
     if (submitBtn) submitBtn.disabled = true;
@@ -799,20 +1013,28 @@ async function handleModalSubmit() {
                 method: "POST",
                 body: JSON.stringify(body)
             });
-            showTabMessage(`✓ Successfully added ${c.singular} "${body[c.idKey]}".`, "success");
         } else {
             await api(`/${c.endpoint}/${encodeURIComponent(originalId)}`, {
                 method: "PUT",
                 body: JSON.stringify(body)
             });
-            showTabMessage(`✓ Successfully updated ${c.singular} "${body[c.idKey]}".`, "success");
         }
 
+        tabDataCache["subjects"] = null;
+        tabDataCache["teachers"] = null;
         closeCrudModal();
+        currentTab = tab;
         await loadTab(tab);
-        await fetchTimeSlots();
-        await refreshStats();
+        if (tab === "timeslots") {
+            await fetchTimeSlots();
+        }
         invalidateClientTimetable("Data changed — please regenerate the timetable.");
+        showTabMessage(
+            mode === "add"
+                ? `✓ Successfully added ${c.singular} "${body[c.idKey]}".`
+                : `✓ Successfully updated ${c.singular} "${body[c.idKey]}".`,
+            "success"
+        );
     } catch (err) {
         if (msgEl) {
             msgEl.className = "status error";
@@ -835,11 +1057,15 @@ async function deleteItem(tab, encodedId) {
         await api(`/${c.endpoint}/${encodeURIComponent(rawId)}`, {
             method: "DELETE"
         });
-        showTabMessage(`✓ Successfully deleted ${c.singular} "${rawId}".`, "success");
+        tabDataCache["subjects"] = null;
+        tabDataCache["teachers"] = null;
+        currentTab = tab;
         await loadTab(tab);
-        await fetchTimeSlots();
-        await refreshStats();
+        if (tab === "timeslots") {
+            await fetchTimeSlots();
+        }
         invalidateClientTimetable("Data changed — please regenerate the timetable.");
+        showTabMessage(`✓ Successfully deleted ${c.singular} "${rawId}".`, "success");
     } catch (err) {
         showTabMessage(err.message || `Failed to delete ${c.singular}.`, "error");
     }
@@ -1630,6 +1856,10 @@ function render(days) {
     }
 
     const colCount = activeSlots.length + 1;
+    const tableEl = document.getElementById("table");
+    if (tableEl && activeSlots.length > 0) {
+        tableEl.style.setProperty("--slot-count", activeSlots.length);
+    }
 
     // Render table header dynamically to match backend slots
     if (tableHead) {
@@ -1826,6 +2056,11 @@ function render(days) {
     }
 
     tableBody.innerHTML = html;
+
+    const scrollWrap = document.querySelector(".timetable-scroll-wrap");
+    if (scrollWrap) {
+        scrollWrap.scrollLeft = 0;
+    }
 }
 
 function showTimetableError(summary, details) {
@@ -1860,6 +2095,16 @@ document.addEventListener("DOMContentLoaded", () => {
     document.querySelectorAll(".nav button").forEach(b => {
         b.onclick = () => page(b.dataset.page);
     });
+
+    const modalForm = document.getElementById("crudModalForm");
+    if (modalForm) {
+        modalForm.onsubmit = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handleModalSubmit(e);
+            return false;
+        };
+    }
 
     document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") {
